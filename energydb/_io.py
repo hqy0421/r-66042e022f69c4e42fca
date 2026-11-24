@@ -283,7 +283,7 @@ async def write_manifest(
 
 # Scoping the annotation to energydb's own relations keeps it off a host
 # application's missing tables, which have nothing to do with ENERGYDB_SCHEMA.
-_ENERGYDB_RELATIONS = frozenset({"node", "edge", "series", "runs", "series_meta"})
+_ENERGYDB_RELATIONS = frozenset({"node", "edge", "series", "runs", "series_meta", "node_path_alias"})
 
 _RELATION_RE = re.compile(r'relation "([^"]+)" does not exist')
 
@@ -668,17 +668,24 @@ async def execute_read(
 
     missing = pl.DataFrame()
 
-    async def _resolve_meta() -> pl.DataFrame | None:
+    async def _resolve_meta() -> tuple[pl.DataFrame | None, bool]:
+        """Resolve to ``(meta, aliased)``; manifests report aliasing via the summary."""
         nonlocal missing
         if resolve is not None:
-            return await resolve()
+            result = await resolve()
+            # ``resolve=`` callers may return a bare frame (``None`` = nothing
+            # matched) or a ``(frame, aliased)`` pair from a path-addressed
+            # scope whose resolve went through a path alias.
+            if isinstance(result, tuple):
+                return result
+            return result, False
         assert manifest is not None
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
             async with client._read_conn() as conn:
-                resolved, summary = await resolve_manifest(conn, manifest, on_missing=on_missing)
+                resolved, summary = await resolve_manifest(conn, manifest, on_missing=on_missing, path_aliases=True)
         missing = summary.missing
         with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
-            return _project_meta(resolved, is_edge=is_edge)
+            return _project_meta(resolved, is_edge=is_edge), bool(summary.aliased_paths)
 
     def _empty() -> tuple[pl.DataFrame | dict, int, pl.DataFrame]:
         if output == "by_path":
@@ -706,13 +713,27 @@ async def execute_read(
 
         engine_task = asyncio.create_task(asyncio.to_thread(_engine_call))
         try:
-            meta = await _resolve_meta()
+            meta, aliased = await _resolve_meta()
         except BaseException:
             # A to_thread CH call is not cancellable, so await it or the query
             # thread outlives the read that started it.
             with contextlib.suppress(BaseException):
                 await engine_task
             raise
+
+        if aliased:
+            # The CH meta-engine resolves series ids from `series_meta`, which
+            # only exposes *live* node paths. A path-addressed resolve answered
+            # through a path alias would trim to an empty result there, so the
+            # engine leg must not be trusted: drain it (a to_thread call is not
+            # cancellable) and read sequentially instead. Not a session degrade —
+            # the engine is fine, it just cannot see aliases.
+            with contextlib.suppress(BaseException):
+                await engine_task
+            if meta is None or meta.height == 0:
+                return _empty()
+            call = _td_call(td, relative=relative, kwargs=kwargs)
+            return await _execute_read(pool, meta, call, unit=unit, output=output), meta.height, missing
 
         try:
             values = await engine_task
@@ -766,7 +787,7 @@ async def execute_read(
         call = _td_call(td, relative=relative, kwargs=kwargs)
         return await _execute_read(pool, meta, call, unit=unit, output=output), meta.height, missing
 
-    meta = await _resolve_meta()
+    meta, _aliased = await _resolve_meta()
     if meta is None or meta.height == 0:
         return _empty()
     call = _td_call(td, relative=relative, kwargs=kwargs)

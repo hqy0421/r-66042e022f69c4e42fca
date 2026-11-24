@@ -58,6 +58,44 @@ if TYPE_CHECKING:
     from energydb.client import AsyncClient
 
 
+async def _record_path_aliases(conn, old_path: str) -> None:
+    """Keep every node's pre-move path readable through ``node_path_alias``.
+
+    ``rename`` / ``move_to`` rewrite ``node.path`` for the whole subtree in one
+    ``UPDATE``; external callers that cached one of those paths would otherwise
+    lose the series they were reading. Recording happens *before* the rewrite,
+    on the same connection/transaction, so a ``dry_run`` rollback or a
+    transaction rollback takes the alias rows with it. ``ON CONFLICT DO
+    NOTHING`` makes a repeated restructure idempotent.
+    """
+    await conn.execute(
+        rf"""
+        INSERT INTO {P}node_path_alias (namespace, old_path, node_uuid)
+        SELECT namespace, path, uuid FROM {P}node
+        WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
+        ON CONFLICT (namespace, old_path, node_uuid) DO NOTHING
+        """,
+        (old_path, _like_escape(old_path)),
+    )
+
+
+def _split_alias_flag(meta: pl.DataFrame | None) -> tuple[pl.DataFrame | None, bool]:
+    """Split a resolver frame into ``(meta, aliased)``.
+
+    Alias-aware resolvers tag their frame with an ``_alias`` boolean column
+    (see :func:`energydb.series.resolve_subtree_series_for_read`); it is a
+    resolve-time guard for the read pipeline, not part of the per-series meta
+    contract, so it is dropped here. Frames without it (identity-addressed
+    resolves) come back unchanged with ``aliased=False``.
+    """
+    if meta is None:
+        return None, False
+    aliased = "_alias" in meta.columns and bool(meta["_alias"].any())
+    if "_alias" in meta.columns:
+        meta = meta.drop("_alias")
+    return (None if meta.is_empty() else meta), aliased
+
+
 def _dry_run_unsupported_in_txn() -> None:
     raise ValidationError("dry_run is not supported inside a transaction(); use txn.preview() instead.")
 
@@ -363,13 +401,19 @@ class _BaseScope:
         """The typed not-found error for this scope's target, addressed by uuid."""
         raise NotImplementedError
 
-    async def _build_resolved_meta(self, *, data_type: str | None, name: str | None) -> pl.DataFrame | None:
+    async def _build_resolved_meta(
+        self, *, data_type: str | None, name: str | None
+    ) -> tuple[pl.DataFrame | None, bool]:
         """Subclass-specific: resolve the scope to per-series meta in PG.
 
-        Returns one row per series with columns ``(series_id, retention,
-        canonical_unit, data_type, name)`` plus exactly one of
-        ``node_uuid`` / ``edge_uuid``, which is the input shape
-        :func:`execute_read` expects. Returns ``None`` when the scope is empty / nothing matches.
+        Returns ``(meta, aliased)``. ``meta`` is one row per series with columns
+        ``(series_id, retention, canonical_unit, data_type, name)`` plus exactly
+        one of ``node_uuid`` / ``edge_uuid``, which is the input shape
+        :func:`execute_read` expects; ``None`` when the scope is empty / nothing
+        matches. ``aliased`` is True when a path-addressed scope was answered
+        through :class:`~energydb.models.NodePathAlias`, i.e. the ``read``
+        pipeline's ClickHouse meta-engine (which only knows live paths) must not
+        be trusted for this resolve.
         """
         raise NotImplementedError
 
@@ -606,7 +650,8 @@ class _BaseScope:
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("resolve")
-        return await self._build_resolved_meta(data_type=data_type, name=name)
+        meta, _aliased = await self._build_resolved_meta(data_type=data_type, name=name)
+        return meta
 
     async def read_from_meta(
         self,
@@ -1062,6 +1107,9 @@ class NodeScope(_BaseScope):
             old_path, parent_path = row
             new_path = f"{parent_path}/{new_name}" if parent_path else new_name
 
+            if new_path != old_path:
+                await _record_path_aliases(conn, old_path)
+
             await conn.execute(
                 rf"""
                 UPDATE {P}node
@@ -1183,6 +1231,9 @@ class NodeScope(_BaseScope):
             old_path, new_parent_path, own_name = row
             new_path = f"{new_parent_path}/{own_name}" if new_parent_path else own_name
 
+            if new_path != old_path:
+                await _record_path_aliases(conn, old_path)
+
             await conn.execute(
                 rf"""
                 UPDATE {P}node
@@ -1251,14 +1302,16 @@ class NodeScope(_BaseScope):
         *,
         data_type: str | None,
         name: str | None,
-    ) -> pl.DataFrame | None:
+    ) -> tuple[pl.DataFrame | None, bool]:
         """Resolve the scope's subtree to per-series read meta in one PG round-trip.
 
         Returns the per-series ``(series_id, retention, canonical_unit,
         data_type, name, node_uuid)`` frame :func:`execute_read` consumes
         directly, with no second hash-and-join pass through
-        :func:`resolve_manifest`. ``None`` when the subtree is empty or no
-        series match the optional ``data_type`` / ``name`` filters.
+        :func:`resolve_manifest`, plus whether a path-addressed scope was
+        answered through a path alias (see the base declaration). ``None`` when
+        the subtree is empty or no series match the optional ``data_type`` /
+        ``name`` filters.
         """
         data_type_str = str(data_type).lower() if data_type else None
         if self._where_filters:
@@ -1281,6 +1334,7 @@ class NodeScope(_BaseScope):
                         where_params=where_params,
                         data_type=data_type_str,
                         name=name,
+                        path_aliases=True,
                     )
                 elif self._node_uuid is not None:
                     meta = await series_mod.resolve_subtree_series_for_read(
@@ -1294,7 +1348,7 @@ class NodeScope(_BaseScope):
                     )
                 else:
                     raise ValidationError("NodeScope has no path or uuid to resolve.")
-        return None if meta.is_empty() else meta
+        return _split_alias_flag(meta)
 
 
 class EdgeScope(_BaseScope):
@@ -1611,12 +1665,15 @@ class EdgeScope(_BaseScope):
         *,
         data_type: str | None,
         name: str | None,
-    ) -> pl.DataFrame | None:
+    ) -> tuple[pl.DataFrame | None, bool]:
         """Resolve this edge to per-series read meta in ONE PG round-trip.
 
         Both addressings go through :func:`series.resolve_edge_series_for_read`
         directly; the triple form collapses the paths → edge → series chain
-        (3 round-trips) into a single query. ``None`` if no series match.
+        (3 round-trips) into a single query, and resolves each endpoint path
+        through a :class:`~energydb.models.NodePathAlias` too (returned ``path``
+        labels stay the requested ones). ``None`` if no series match, plus the
+        aliased flag for the read pipeline's engine guard.
         """
         data_type_str = str(data_type).lower() if data_type else None
         # Client read checkout (namespace GUC) — see NodeScope._build_resolved_meta.
@@ -1638,7 +1695,8 @@ class EdgeScope(_BaseScope):
                         edge_name=self._edge_name,
                         data_type=data_type_str,
                         name=name,
+                        path_aliases=True,
                     )
                 else:
                     raise ValidationError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
-        return None if meta.is_empty() else meta
+        return _split_alias_flag(meta)

@@ -204,6 +204,44 @@ class Series(Base):
     )
 
 
+class NodePathAlias(Base):
+    """A node's former materialized path, kept readable after a restructure.
+
+    ``rename`` / ``move_to`` rewrite ``node.path`` for a whole subtree in one
+    ``UPDATE``. External callers that cached the old path would otherwise lose
+    the series they were reading (or, worse, silently start reading whichever
+    unrelated node later claims that path). Every rewritten row therefore
+    leaves an alias row behind, and the path-addressed *read* routes consult it.
+
+    Identity is the full triple: one old path can legitimately have been held
+    by several nodes over time, so the parser sees every candidate and raises a
+    conflict rather than letting a later owner overwrite the history. The
+    composite FK (and its ``ON DELETE CASCADE``) makes a cross-namespace alias
+    unrepresentable and drops aliases with their node.
+    """
+
+    __tablename__ = "node_path_alias"
+
+    namespace = sa.Column(sa.Text, primary_key=True, server_default=NAMESPACE_DEFAULT)
+    old_path = sa.Column(sa.Text, primary_key=True)
+    node_uuid = sa.Column(UUID(as_uuid=True), primary_key=True)
+    created_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
+
+    __table_args__ = (
+        sa.ForeignKeyConstraint(
+            ["node_uuid", "namespace"],
+            [_fk("node.uuid"), _fk("node.namespace")],
+            ondelete="CASCADE",
+            name="node_path_alias_node_fkey",
+        ),
+        # Lookups are by old path; the PK prefix already serves that, this keeps
+        # the intent explicit and the per-node cleanup indexed.
+        sa.Index("ix_node_path_alias_old_path", "old_path"),
+        sa.Index("ix_node_path_alias_node_uuid", "node_uuid"),
+        {"schema": SCHEMA},
+    )
+
+
 class Run(Base):
     """Run metadata. ``run_id`` is client-generated (uuid7 → UInt64 truncate),
     so writes don't wait on a PG allocation round-trip.

@@ -392,6 +392,84 @@ The same surface exists on edges (edge ``move_to`` takes keyword-only
    e.delete()
 
 
+.. _sdk-path-aliases:
+
+Path aliases: reads survive a rename or move
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``rename`` and ``move_to`` rewrite ``node.path`` for the whole subtree. A
+caller that cached a path — a scheduler config, a dashboard's saved query, an
+older service still on the previous release — would otherwise lose its series,
+or worse, silently start reading whichever unrelated node later claimed that
+path. Every rewritten path is therefore recorded in ``node_path_alias``, and
+the **path-addressed read** routes resolve through it:
+
+- ``NodeScope.read()`` on a path scope (including an aliased subtree prefix),
+- ``Client.read()`` / ``read_relative()`` with a ``path`` manifest column,
+- ``get_edge(from, to, type=...)`` and edge-triple manifests whose endpoint
+  paths an alias now answers.
+
+What stays stable, and what changes:
+
+.. code-block:: python
+
+   t01 = client.get_node("my-portfolio", "Offshore-1", "T01")
+   t01.register_series(name="power", canonical_unit="MW", data_type="actual",
+                       timeseries_type="FLAT")
+   t01.write(df, data_type="actual", name="power")
+
+   t01.rename("T01-A")
+
+   # Same UUID, same values — the result still carries the path you asked for:
+   out = client.get_node("my-portfolio", "Offshore-1", "T01").read(
+       data_type="actual", name="power")
+   out["path"].unique().to_list()          # ['my-portfolio/Offshore-1/T01']
+
+   client.read(pl.DataFrame([{
+       "path": "my-portfolio/Offshore-1/T01",
+       "data_type": "actual", "name": "power"}]))
+
+Confirmed rules:
+
+- The **result labels are the requested paths** — ``path`` for node routes,
+  ``from_path`` / ``to_path`` for edge routes, and the ``SeriesKey.path`` /
+  ``EdgeSeriesKey.from_path`` keys of ``output="by_path"``. Your cached keys
+  keep matching.
+- **A path claimed by more than one node raises.** If a *different* node has
+  since taken over an old path, energydb cannot tell which one you meant, so it
+  raises :class:`~energydb.errors.PathAliasConflictError` — with
+  ``.path`` and ``.candidates`` (``{"uuid", "current_path"}`` per claimant) —
+  rather than returning either one's data. This is an addressing error, so it
+  raises even under ``on_missing="skip"``.
+- **Writes and structure do not follow aliases.** ``write`` to a renamed-away
+  path still fails with :class:`~energydb.errors.SeriesNotFoundError`, and
+  ``get`` / ``children`` / ``descendants`` / ``path`` / ``move_to(target)`` /
+  ``create_node(parent=)`` keep using live paths only. A path is history for
+  reading; it is never a live address for writing or navigation.
+- Aliases are recorded by ``rename`` and ``move_to`` only. ``dry_run`` and a
+  rolled-back :meth:`~energydb.AsyncClient.transaction` leave none behind, and
+  deleting the node drops its aliases (``ON DELETE CASCADE``).
+
+To confirm how a path resolves today — for an operator, an API request, or a
+migration report — use the read-only helpers. They are the only alias
+operations: there is no delete or re-point.
+
+.. code-block:: python
+
+   client.get_path_alias("my-portfolio/Offshore-1/T01")
+   # {'path': 'my-portfolio/Offshore-1/T01',
+   #  'uuid': '01a2…', 'current_path': 'my-portfolio/Offshore-1/T01-A',
+   #  'is_alias': True}                    # None if nothing answers;
+   #                                       # raises on a conflict, like a read
+
+   client.list_path_aliases(prefix="my-portfolio/Offshore-1")
+   # [{'path': ..., 'uuid': ..., 'current_path': ..., 'node_type': ...,
+   #   'created_at': ...}, ...]            # (path, uuid) order; limit=/after=
+
+On a namespaced view both are scoped to that namespace, so an identically
+named path in another tenant is neither visible nor a conflict.
+
+
 Declaring series
 ~~~~~~~~~~~~~~~~
 
@@ -1212,6 +1290,7 @@ the package root, so ``from energydb import SeriesNotFoundError`` works.
    ├── ValidationError            — invalid arguments or invalid operation
    │   ├── AmbiguousEdgeError     — edge triple matches several parallel edges
    │   ├── ManifestError          — structurally invalid manifest
+   │   ├── PathAliasConflictError — an old path is claimed by several nodes
    │   └── UnchangedScopeError    — scope would drop OVERLAPPING revisions
    ├── ConfigurationError         — client / environment misconfiguration
    └── IncompatibleUnitError      — dimensionally incompatible unit conversion
@@ -1281,6 +1360,9 @@ keyword-only and default to ``None`` when the raise site does not know them;
    * - :class:`~energydb.errors.SeriesNotFoundError`
      - ``route`` (``"path"`` / ``"node_uuid"`` / ``"edge_uuid"`` / the edge
        triple), ``missing`` (every unresolved ``(owner, data_type, name)``)
+   * - :class:`~energydb.errors.PathAliasConflictError`
+     - ``path``, ``candidates`` (every claimant as
+       ``{"path", "uuid", "current_path"}``)
    * - :class:`~energydb.errors.UnchangedScopeError`
      - ``overlapping_series_ids``
 
@@ -1305,6 +1387,11 @@ What raises what
   triple, an ``edge_name`` column without that triple, missing ``data_type``
   / ``name``, a ``List(Utf8)`` ``path`` column (use ``Utf8`` joined with
   ``/``), or null routing values.
+- :class:`~energydb.errors.PathAliasConflictError` — a path-addressed *read*
+  names a path that a ``rename`` / ``move_to`` moved a node away from, and a
+  different node now claims it. Raises under ``on_missing="skip"`` too; read
+  the intended series by its current path or by uuid. See
+  `Path aliases: reads survive a rename or move`_.
 - :class:`~energydb.errors.UnchangedScopeError` —
   ``unchanged_scope="valid_time"`` on a manifest containing OVERLAPPING
   series, which would drop their republications. See
@@ -1400,6 +1487,49 @@ Best Practices
 
 
 .. _sdk-upgrading:
+
+Upgrading to 0.12.0
+-------------------
+
+Aliases are recorded by ``rename`` / ``move_to`` and consulted by the
+path-addressed read routes (see `Path aliases: reads survive a rename or
+move`_). Three things to know:
+
+- **``create()`` adds a table.** ``node_path_alias`` is new; ``create()`` on a
+  new database creates it, but there is no migration for an existing one (same
+  stance as every prior release). Run:
+
+  .. code-block:: sql
+
+     CREATE TABLE IF NOT EXISTS energydb.node_path_alias (
+       namespace text NOT NULL DEFAULT 'default',
+       old_path  text NOT NULL,
+       node_uuid uuid NOT NULL,
+       created_at timestamptz NOT NULL DEFAULT now(),
+       PRIMARY KEY (namespace, old_path, node_uuid),
+       CONSTRAINT node_path_alias_node_fkey
+         FOREIGN KEY (node_uuid, namespace)
+         REFERENCES energydb.node (uuid, namespace) ON DELETE CASCADE
+     );
+     CREATE INDEX IF NOT EXISTS ix_node_path_alias_old_path
+       ON energydb.node_path_alias (old_path);
+     CREATE INDEX IF NOT EXISTS ix_node_path_alias_node_uuid
+       ON energydb.node_path_alias (node_uuid);
+
+  Until it exists, ``rename`` / ``move_to`` and the alias helpers raise the
+  usual schema-misconfiguration error naming the missing relation — the
+  create statement is required, as with every prior schema change. Drop the
+  ``energydb.`` qualifier if your tables live in ``public``.
+
+- **Reads may now resolve a path the caller no longer owns**, including paths
+  from before the upgrade that move after it. Behaviour before the change was
+  a ``NodeNotFoundError`` / ``SeriesNotFoundError``; the data returned is the
+  series under the same UUID, so nothing new is exposed.
+- **``path`` claims by two nodes now raise**
+  :class:`~energydb.errors.PathAliasConflictError` instead of resolving to one
+  of them. That can only fire against a state the previous release could not
+  report at all, so no status quo ante is lost. Writes and structural
+  enumeration are untouched.
 
 Upgrading to 0.11.0
 -------------------

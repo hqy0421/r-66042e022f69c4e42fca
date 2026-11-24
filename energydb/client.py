@@ -71,7 +71,9 @@ from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.paths import (
     OnMissing,
     Path,
+    _conflict_claimants,
     _like_escape,
+    _path_alias_conflict,
     build_filter_conditions,
     derived_prefix_like,
     resolve_node_uuid,
@@ -362,7 +364,7 @@ class AsyncClient:
         self._require_root("delete")
         async with annotate_undefined_table(), self._pool.connection() as conn:
             if SCHEMA is None:
-                await conn.execute("DROP TABLE IF EXISTS series, runs, edge, node CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS series, runs, node_path_alias, edge, node CASCADE")
             else:
                 await conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
             await conn.commit()
@@ -811,6 +813,92 @@ class AsyncClient:
                 "canonical_unit": r[3],
                 "timeseries_type": r[4],
                 "description": r[5],
+            }
+            for r in rows
+        ]
+
+    async def get_path_alias(self, path: str | Path | list[str]) -> dict | None:
+        """Confirm how a path-addressed read resolves *right now*.
+
+        Read-only. Node reads by path keep resolving paths that a
+        :class:`~energydb.NodeScope.rename` / :meth:`NodeScope.move_to` moved a
+        node away from (see :class:`~energydb.models.NodePathAlias`); this is
+        the inspection counterpart, so an operator can see whether a cached path
+        is a live path, an alias, or ambiguous.
+
+        Returns ``{"path", "uuid", "current_path", "is_alias"}``, where
+        ``path`` is the requested path (echoed back), ``uuid`` the node that
+        answers it, ``current_path`` that node's path today, and ``is_alias``
+        whether the answer came from an alias (``current_path != path``).
+        ``None`` when no node answers the path. Raises
+        :class:`~energydb.errors.PathAliasConflictError` when several nodes do
+        — same as a read would, rather than picking one arbitrarily.
+
+        Read-only by design: aliases are maintained by the restructure
+        operations and cannot be deleted or re-pointed here.
+        """
+        req = path if isinstance(path, str) else "/".join(_coerce_path((), kwarg=path))
+        async with self._read_conn() as conn:
+            claimants = (await _conflict_claimants(conn, [req], namespace=self._namespace))[req]
+        if not claimants:
+            return None
+        if len(claimants) > 1:
+            raise _path_alias_conflict({req: claimants})
+        uuid_, current_path = next(iter(claimants.items()))
+        return {"path": req, "uuid": uuid_, "current_path": current_path, "is_alias": current_path != req}
+
+    async def list_path_aliases(
+        self,
+        *,
+        prefix: str | None = None,
+        limit: int | None = None,
+        after: tuple[str, str] | None = None,
+    ) -> list[dict]:
+        """List the recorded path aliases, one row per (old path, node).
+
+        Read-only. Each row is ``{"path", "uuid", "current_path", "node_type",
+        "created_at"}``: the old path, the node it still addresses, that
+        node's *current* path, its type, and when the alias was recorded.
+        Ordered by ``(path, uuid)``; ``after`` is a ``(path, uuid)`` keyset
+        cursor and ``limit`` caps the page. ``prefix`` restricts to old paths at
+        or under that ``/``-joined path (prefix semantics, like a subtree read).
+
+        On a namespaced view the rows are constrained to the view's namespace
+        explicitly, independent of whether RLS policies are installed.
+
+        An old path that several nodes have held over time appears once per
+        node: listing is for confirmation, so it shows the history rather than
+        collapsing it.
+        """
+        conditions: list[str] = []
+        params: list[Any] = []
+        if self._namespace is not None:
+            conditions.append("a.namespace = %s")
+            params.append(self._namespace)
+        if prefix is not None:
+            conditions.append("(a.old_path = %s OR a.old_path LIKE %s || '/%%' ESCAPE '\\')")
+            params.extend([prefix, _like_escape(prefix)])
+        if after is not None:
+            conditions.append("(a.old_path, a.node_uuid::text) > (%s, %s)")
+            params.extend([after[0], str(after[1])])
+        where = " AND ".join(conditions) if conditions else "TRUE"
+        sql = (
+            "SELECT a.old_path, a.node_uuid::text, n.path, n.node_type, a.created_at "
+            f"FROM {P}node_path_alias a JOIN {P}node n ON n.uuid = a.node_uuid "
+            f"WHERE {where} ORDER BY a.old_path, a.node_uuid::text"
+        )
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(limit)
+        async with self._read_conn() as conn:
+            rows = await (await conn.execute(sql, params)).fetchall()  # ty: ignore[invalid-argument-type]
+        return [
+            {
+                "path": r[0],
+                "uuid": r[1],
+                "current_path": r[2],
+                "node_type": r[3],
+                "created_at": r[4],
             }
             for r in rows
         ]

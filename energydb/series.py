@@ -16,6 +16,7 @@ migration.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Literal
 from uuid import UUID
 
@@ -24,7 +25,13 @@ from timedb import RETENTION_TIERS
 
 from energydb.errors import AlreadyExistsError, EdgeNotFoundError, ValidationError
 from energydb.models import SQL_SCHEMA_PREFIX as P
-from energydb.paths import ambiguous_edge_error, edge_address_repr
+from energydb.paths import (
+    _candidate_cte,
+    _conflict_claimants,
+    _path_alias_conflict,
+    ambiguous_edge_error,
+    edge_address_repr,
+)
 
 OwnerCol = Literal["node_uuid", "edge_uuid"]
 
@@ -189,6 +196,55 @@ async def register_series(
     return existing_sid
 
 
+_SUBTREE_META_SCHEMA = {
+    "series_id": pl.Int64,
+    "canonical_unit": pl.Utf8,
+    "timeseries_type": pl.Utf8,
+    "retention": pl.Utf8,
+    "node_uuid": pl.Utf8,
+    "data_type": pl.Utf8,
+    "name": pl.Utf8,
+    "path": pl.Utf8,
+}
+
+
+def _subtree_frame(rows: Sequence[tuple], *, with_alias_row: bool) -> pl.DataFrame:
+    """Build the per-series subtree read-meta frame from raw rows.
+
+    ``with_alias_row`` is for the alias-aware branch, whose rows carry two
+    trailing columns: ``_alias`` (the prefix was answered by an alias, so the
+    meta-engine's live-path predicate cannot be trusted) and ``n_cand`` (a
+    caller-side conflict check). A LEFT-JOIN row for a series-less candidate is
+    dropped here rather than packaged as a bogus series.
+    """
+    data: list[dict[str, Any]] = []
+    aliased = False
+    for row in rows:
+        if with_alias_row:
+            aliased = aliased or bool(row[8])
+            if row[0] is None:  # series-less candidate (LEFT JOIN row)
+                continue
+            row = row[:8]
+        data.append(
+            {
+                "series_id": row[0],
+                "canonical_unit": row[1],
+                "timeseries_type": row[2],
+                "retention": row[3],
+                "node_uuid": row[4],
+                "data_type": row[5],
+                "name": row[6],
+                "path": row[7],
+            }
+        )
+    df = pl.DataFrame(data, schema=_SUBTREE_META_SCHEMA)
+    if with_alias_row:
+        # Attribute the read as alias-resolved so execute_read can skip the
+        # engine leg (see energydb._io.execute_read).
+        df = df.with_columns(pl.lit(aliased).alias("_alias"))
+    return df
+
+
 async def resolve_subtree_series_for_read(
     conn,
     *,
@@ -199,6 +255,7 @@ async def resolve_subtree_series_for_read(
     where_params: list[Any] | None = None,
     data_type: str | None = None,
     name: str | None = None,
+    path_aliases: bool = False,
 ) -> pl.DataFrame:
     """Resolve a node subtree straight to per-series read meta in ONE round-trip.
 
@@ -217,6 +274,17 @@ async def resolve_subtree_series_for_read(
     (``series_id``, ``canonical_unit``, ``timeseries_type``, ``retention``,
     ``node_uuid``, ``data_type``, ``name``, ``path``). Empty df if the subtree
     is empty or nothing matches.
+
+    ``path_aliases=True`` (read pipelines, ``root_path`` only) additionally
+    consults :class:`~energydb.models.NodePathAlias`: the requested prefix may
+    name a path the root node has been renamed/moved away from. The returned
+    ``path`` then stays the *requested* prefix plus each series' relative
+    suffix, so a caller's old path keys keep matching. The frame gains an
+    ``_alias`` bool column (True when the prefix came from an alias) for the
+    read pipeline's engine guard, and the resolve raises
+    :class:`~energydb.errors.PathAliasConflictError` when the prefix is claimed
+    by more than one node. The ``start_uuid`` forms are identity-addressed and
+    ignore the flag.
     """
     cte_params: list[Any] = []
     if root_path is not None:
@@ -243,6 +311,48 @@ async def resolve_subtree_series_for_read(
 
     # The prefix can be DB-derived, so it cannot always be escaped Python-side;
     # escaping LIKE metacharacters in SQL keeps this to one round-trip.
+    if path_aliases and root_path is not None:
+        # The requested prefix may be a path the root moved away from. Resolve
+        # it to a node through the alias table, then run the usual prefix scan
+        # from that node's *current* path — but label rows with the requested
+        # prefix so a caller's old keys keep matching.
+        #
+        # series is LEFT-JOINed (filters in the ON clause) so a candidate with
+        # no matching series still produces a row: that is what lets the
+        # claimant count be read even from an empty resolve, keeping a conflict
+        # between two series-less nodes from silently reading as "no data".
+        join_extra = (" AND " + " AND ".join(where_parts)) if where_parts else ""
+        sql = rf"""
+        WITH req AS (SELECT %s::text AS req_rp),
+        cand AS (
+            SELECT n.uuid, n.path AS cur_rp
+            FROM req r JOIN {P}node n ON n.path = r.req_rp
+            UNION ALL
+            SELECT a.node_uuid, nn.path
+            FROM req r JOIN {P}node_path_alias a ON a.old_path = r.req_rp
+                        JOIN {P}node nn ON nn.uuid = a.node_uuid
+        ), root AS (
+            SELECT r.req_rp, (SELECT count(DISTINCT uuid) FROM cand) AS n_cand,
+                   (SELECT min(cur_rp) FROM cand) AS cur_rp
+            FROM req r
+        )
+        SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
+               s.node_uuid::text AS node_uuid, s.data_type, s.name,
+               %s::text || substring(n.path FROM length(r.cur_rp) + 1) AS path,
+               (r.cur_rp <> r.req_rp) AS _alias, r.n_cand
+        FROM root r
+        JOIN {P}node n
+          ON (n.path = r.cur_rp
+              OR n.path LIKE
+                 replace(replace(replace(r.cur_rp, E'\\', E'\\\\'), '%%', E'\\%%'), '_', E'\\_')
+                 || '/%%' ESCAPE '\')
+        LEFT JOIN {P}series s ON s.node_uuid = n.uuid{join_extra}
+        """
+        rows = await (await conn.execute(sql, (cte_params[0], root_path, *where_vals))).fetchall()
+        if rows and rows[0][9] > 1:
+            raise _path_alias_conflict(await _conflict_claimants(conn, [root_path]))
+        return _subtree_frame(rows, with_alias_row=True)
+
     sql = rf"""
         WITH root AS ({root_cte})
         SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
@@ -257,32 +367,7 @@ async def resolve_subtree_series_for_read(
         WHERE TRUE{where_clause}
     """
     rows = await (await conn.execute(sql, [*cte_params, *where_vals])).fetchall()
-
-    return pl.DataFrame(
-        [
-            {
-                "series_id": r[0],
-                "canonical_unit": r[1],
-                "timeseries_type": r[2],
-                "retention": r[3],
-                "node_uuid": r[4],
-                "data_type": r[5],
-                "name": r[6],
-                "path": r[7],
-            }
-            for r in rows
-        ],
-        schema={
-            "series_id": pl.Int64,
-            "canonical_unit": pl.Utf8,
-            "timeseries_type": pl.Utf8,
-            "retention": pl.Utf8,
-            "node_uuid": pl.Utf8,
-            "data_type": pl.Utf8,
-            "name": pl.Utf8,
-            "path": pl.Utf8,
-        },
-    )
+    return _subtree_frame(rows, with_alias_row=False)
 
 
 async def resolve_edge_series_for_read(
@@ -295,6 +380,7 @@ async def resolve_edge_series_for_read(
     edge_name: str | None = None,
     data_type: str | None = None,
     name: str | None = None,
+    path_aliases: bool = False,
 ) -> pl.DataFrame:
     """Resolve an edge's series for a read in ONE round-trip.
 
@@ -318,6 +404,15 @@ async def resolve_edge_series_for_read(
       :class:`~energydb.errors.AmbiguousEdgeError` (pass ``edge_name``);
     * uuid-addressed + edge missing → empty df, by contract;
     * edge exists, nothing matches → empty df.
+
+    ``path_aliases=True`` (read pipelines) additionally resolves each endpoint
+    path through :class:`~energydb.models.NodePathAlias`, so a triple naming a
+    path an endpoint has since moved away from still finds the edge. The
+    returned ``from_path`` / ``to_path`` stay the *requested* paths, an
+    ``_alias`` bool column reports whether an endpoint came from an alias (the
+    read pipeline's engine guard), and an endpoint path claimed by several
+    nodes raises :class:`~energydb.errors.PathAliasConflictError` — even when
+    no edge joins on it.
     """
     join_conds = ["s.edge_uuid = e.uuid"]
     join_params: list[Any] = []
@@ -340,9 +435,86 @@ async def resolve_edge_series_for_read(
     else:
         raise ValidationError("resolve_edge_series_for_read needs edge_uuid or (from_path, to_path, edge_type).")
 
+    alias_triple = path_aliases and edge_uuid is None
+
     # ::text skips psycopg's per-row UUID parse. The edge uuid comes from e, not
     # s, so it is populated on the LEFT-JOIN row of a series-less edge, which is
     # the row the ambiguity check counts.
+    if alias_triple:
+        assert from_path is not None and to_path is not None and edge_type is not None
+        # Endpoint paths resolve live-or-alias (as on the node route), and the
+        # projected paths stay the requested ones. Two marker branches report an
+        # endpoint path claimed by several nodes even when no edge joins on it,
+        # which the edge ⋈ candidate join alone would read as "edge not found".
+        # Row layout: (series_id, canonical_unit, timeseries_type, retention,
+        # edge_uuid, data_type, name, edge_type, edge_name, from_path, to_path,
+        # conflict_side, f_alias, t_alias).
+        T = "NULL::text"
+        B = "NULL::bool"
+        NF, NT = "NULL::bigint", "NULL::text"
+        FILL_AFTER_SID = [NF] + [NT] * 8  # cols 0..8 on a from_path marker
+        FILL_TO_FROM = [NF] + [NT] * 9  # cols 0..9 on a to_path marker
+        edge_where = "e.edge_type = %s" + (" AND e.name = %s" if edge_name is not None else "")
+        edge_params = [edge_type, *([edge_name] if edge_name is not None else [])]
+        sql = (
+            _candidate_cte("f", leading=True)
+            + _candidate_cte("t", leading=False)
+            + f"""
+        SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
+               e.uuid::text, s.data_type, s.name, e.edge_type, e.name,
+               cf.req_path AS from_path, ct.req_path AS to_path,
+               {T} AS conflict_side,
+               (cf.cur_path <> cf.req_path) AS f_alias,
+               (ct.cur_path <> ct.req_path) AS t_alias
+        FROM {P}edge e
+        JOIN c_f cf ON cf.uuid = e.from_node_uuid
+        JOIN c_t ct ON ct.uuid = e.to_node_uuid
+        LEFT JOIN {P}series s ON """
+            + " AND ".join(join_conds)
+            + f" WHERE {edge_where}"
+            + f"""
+        UNION ALL
+        SELECT {", ".join(FILL_AFTER_SID)}, x.req_path, {T}, 'from_path', {B}, {B}
+        FROM (SELECT req_path FROM c_f GROUP BY req_path HAVING count(DISTINCT uuid) > 1) x
+        UNION ALL
+        SELECT {", ".join(FILL_TO_FROM)}, y.req_path, 'to_path', {B}, {B}
+        FROM (SELECT req_path FROM c_t GROUP BY req_path HAVING count(DISTINCT uuid) > 1) y
+        """
+        )
+        rows = await (
+            await conn.execute(sql, ([from_path], [to_path], *join_params, *edge_params))
+        ).fetchall()
+
+        conflicted: dict[str, dict[str, str]] = {}
+        for row in rows:
+            if row[11] == "from_path":
+                conflicted.setdefault(row[9], {})
+            elif row[11] == "to_path":
+                conflicted.setdefault(row[10], {})
+        if conflicted:
+            raise _path_alias_conflict(await _conflict_claimants(conn, sorted(conflicted)))
+
+        if not rows:
+            raise EdgeNotFoundError(
+                f"Edge not found: {edge_address_repr(from_path, to_path, edge_type, edge_name)}",
+                from_path=from_path,
+                to_path=to_path,
+                edge_type=edge_type,
+                name=edge_name,
+            )
+        matched = {r[4]: r[8] for r in rows}
+        if len(matched) > 1:
+            raise ambiguous_edge_error(
+                from_path=from_path,
+                to_path=to_path,
+                edge_type=edge_type,
+                matches=list(matched.items()),
+                fix="pass name= to address one of them",
+            )
+        aliased = any(bool(r[12]) or bool(r[13]) for r in rows)
+        frame = _edge_series_frame(rows)
+        return frame.with_columns(pl.lit(aliased).alias("_alias"))
+
     sql = (
         "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
         "e.uuid::text, s.data_type, s.name, "
@@ -377,6 +549,16 @@ async def resolve_edge_series_for_read(
                 fix="pass name= to address one of them",
             )
 
+    return _edge_series_frame(rows)
+
+
+def _edge_series_frame(rows: Sequence[tuple]) -> pl.DataFrame:
+    """Build the per-series edge read-meta frame from raw resolver rows.
+
+    Only the first eleven columns are read (the alias branch appends conflict /
+    alias markers after them); a LEFT-JOIN row for a series-less edge is
+    dropped rather than packaged as a bogus series.
+    """
     return pl.DataFrame(
         [
             {

@@ -190,6 +190,10 @@ root. See :ref:`the SDK error-handling guide <sdk-error-handling>` for usage.
    :members:
    :show-inheritance:
 
+.. autoexception:: energydb.errors.PathAliasConflictError
+   :members:
+   :show-inheritance:
+
 .. autoexception:: energydb.errors.UnchangedScopeError
    :members:
    :show-inheritance:
@@ -270,7 +274,7 @@ enforced in Python by ``register_series`` rather than by a DB trigger, so the
 schema is fully Alembic-autogeneratable.
 
 .. automodule:: energydb.models
-   :members: Node, Edge, Series, Run
+   :members: Node, Edge, Series, Run, NodePathAlias
    :show-inheritance:
 
 The ``energydb.series`` table is polymorphic: each row is owned by exactly
@@ -278,3 +282,9 @@ one of ``node_uuid`` / ``edge_uuid`` (DB ``CHECK`` enforces). The
 ``series_id`` primary key stays ``BIGINT`` — it's the timedb-internal
 handle. Identity for nodes and edges is a ``UUID`` primary key, matching
 the in-memory ``Element.id``.
+
+``energydb.node_path_alias`` records the paths a subtree rewrite vacated:
+one row per ``(namespace, old_path, node_uuid)``, written by
+:meth:`NodeScope.rename <energydb.NodeScope.rename>` and
+:meth:`NodeScope.move_to <energydb.NodeScope.move_to>`, deleted with its
+node (``ON DELETE CASCADE``). See :ref:`sdk-path-aliases`.

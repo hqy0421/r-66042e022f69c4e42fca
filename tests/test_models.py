@@ -159,5 +159,5 @@ class TestNamespaceTenancy:
 
 
 def test_base_has_expected_tables():
-    for name in ("node", "edge", "series", "runs"):
+    for name in ("node", "edge", "series", "runs", "node_path_alias"):
         assert _metadata_key(name) in Base.metadata.tables

@@ -166,6 +166,34 @@ class AmbiguousEdgeError(ValidationError):
         self.matches: list[dict[str, Any]] | None = None if matches is None else [dict(m) for m in matches]
 
 
+class PathAliasConflictError(ValidationError):
+    """A requested (former) path is claimed by several nodes.
+
+    ``rename`` / ``move_to`` keep every rewritten path readable through
+    :class:`~energydb.models.NodePathAlias`. When a *different* node has since
+    taken over one of those old paths, resolving it would be a guess between
+    two real nodes; energydb refuses rather than hand back the wrong series'
+    data.
+
+    ``path`` is the ``/``-joined path that was addressed. ``candidates``
+    carries every claimant as ``{"uuid": UUID, "current_path": str}`` in
+    ``current_path`` order, so an API server can show both sides instead of
+    parsing the message. Read the right series by the claimant's current path,
+    or by uuid.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: str | None = None,
+        candidates: Sequence[Mapping[str, Any]] | None = None,
+    ):
+        super().__init__(message)
+        self.path = path
+        self.candidates: list[dict[str, Any]] | None = None if candidates is None else [dict(c) for c in candidates]
+
+
 class UnknownElementTypeError(ValidationError):
     """A stored ``node_type`` / ``edge_type`` has no class in the EDM registry.
 
@@ -226,6 +254,7 @@ __all__ = [
     "ManifestError",
     "NodeNotFoundError",
     "NotFoundError",
+    "PathAliasConflictError",
     "SeriesNotFoundError",
     "UnchangedScopeError",
     "UnknownElementTypeError",

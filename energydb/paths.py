@@ -28,6 +28,7 @@ from energydb.errors import (
     EdgeNotFoundError,
     ManifestError,
     NodeNotFoundError,
+    PathAliasConflictError,
     SeriesNotFoundError,
     ValidationError,
 )
@@ -62,10 +63,16 @@ class ResolveSummary(NamedTuple):
     always present, and zero-row (with the route's column schema) unless
     ``on_missing="skip"`` dropped something; riding on the summary keeps the
     resolver's ``(resolved, summary)`` return arity stable.
+
+    ``aliased_paths`` carries the requested paths that were answered through an
+    alias (the node moved away from that path). The ClickHouse meta-engine
+    resolves ids from *live* paths only, so the read pipeline must not trust an
+    engine leg for those (see :func:`energydb._io.execute_read`).
     """
 
     overlapping_series_ids: frozenset[int]
     missing: pl.DataFrame
+    aliased_paths: frozenset[str] = frozenset()
 
     @property
     def has_overlapping(self) -> bool:
@@ -156,6 +163,109 @@ def derived_prefix_like(expr: str) -> str:
     explicit ``path = r.path`` term when the root row itself should match.
     """
     return rf"replace(replace(replace({expr}, E'\\', E'\\\\'), '%%', E'\\%%'), '_', E'\\_') || '/%%'"
+
+
+def _candidate_cte(tag: str, *, leading: bool) -> str:
+    r"""``req[_<tag>]`` + ``c[<tag>]`` CTEs: requested path → candidate node(s).
+
+    ``c<tag>.req_path`` is the path the *caller* asked for (possibly one the node
+    has since moved away from), so downstream projections label results with the
+    requested path rather than the node's current one. ``c<tag>.uuid`` is a node
+    that answers it — a live node holding that path, or the node an alias row
+    points at — and ``c<tag>.cur_path`` is that node's current path, which tells
+    an alias-resolved row apart from a live one.
+
+    Both arms can fire for one path. That is the conflict the callers report
+    instead of resolving: :class:`~energydb.errors.PathAliasConflictError`.
+
+    The single bind parameter is a ``text[]`` of requested paths.
+    ``leading`` emits the ``WITH`` keyword, or a comma continuation when another
+    CTE (the folded runs upsert) already opened the clause.
+    """
+    rp, cand = f"req_{tag}", f"c_{tag}"
+    body = f"""{rp} AS (SELECT DISTINCT unnest(%s::text[]) AS req_path),
+        {cand} AS (
+            SELECT r.req_path, n.uuid, n.path AS cur_path
+            FROM {rp} r JOIN {P}node n ON n.path = r.req_path
+            UNION ALL
+            SELECT r.req_path, a.node_uuid, nn.path
+            FROM {rp} r JOIN {P}node_path_alias a ON a.old_path = r.req_path
+                        JOIN {P}node nn ON nn.uuid = a.node_uuid
+        )"""
+    return ("WITH " if leading else ",\n        ") + body
+
+
+def _path_alias_conflict(conflicts: dict[str, dict[str, str]]) -> PathAliasConflictError:
+    """Build the conflict error for paths claimed by more than one node.
+
+    ``conflicts`` maps the requested path to ``{uuid: current_path}``.
+    The message names the first path (sorted, so it is stable) with its
+    claimants; ``candidates`` carries *every* conflicted path's claimants.
+    """
+    first = min(conflicts)
+    claimants = conflicts[first]
+    ordered = sorted(claimants.items(), key=lambda kv: (kv[1], kv[0]))
+    rendered = ", ".join(f"{uuid_} (now at {cur!r})" for uuid_, cur in ordered)
+    candidates = [
+        {"path": path, "uuid": uuid_, "current_path": cur}
+        for path in sorted(conflicts)
+        for uuid_, cur in sorted(conflicts[path].items(), key=lambda kv: (kv[1], kv[0]))
+    ]
+    message = (
+        f"Path conflict: {first!r} is claimed by {len(claimants)} nodes ({rendered}); "
+        "refusing to pick one. Read the intended series by its current path or by uuid."
+    )
+    return PathAliasConflictError(message, path=first, candidates=candidates)
+
+
+def _collect_conflicts(candidates_by_path: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+    """The requested paths with more than one distinct candidate node.
+
+    An empty series set must not hide a conflict, so callers feed this every
+    candidate the resolve saw, not just the ones that matched a series.
+    """
+    return {path: claimants for path, claimants in candidates_by_path.items() if len(claimants) > 1}
+
+
+async def _conflict_claimants(conn, paths: list[str], *, namespace: str | None = None) -> dict[str, dict[str, str]]:
+    """``{requested_path: {uuid: current_path}}`` for the given paths.
+
+    Error path only: the edge-triple resolve surfaces conflicts without the
+    claimants' details, so they are fetched here rather than on every read.
+    ``namespace`` narrows both arms to one tenant; read pipelines leave it
+    ``None`` (they rely on the GUC / RLS for that), while the namespaced
+    confirmation API passes it so an identically named path in another
+    namespace cannot look like a conflict.
+    """
+    ns_node = " AND n.namespace = %s" if namespace is not None else ""
+    ns_alias = " AND a.namespace = %s" if namespace is not None else ""
+    params: list[Any] = [paths]
+    if namespace is not None:
+        params.append(namespace)
+    params.append(paths)
+    if namespace is not None:
+        params.append(namespace)
+    rows = await (
+        await conn.execute(
+            f"""
+        SELECT req_path, uuid::text, cur_path FROM (
+            SELECT n.path AS req_path, n.uuid, n.path AS cur_path
+            FROM {P}node n JOIN unnest(%s::text[]) AS r(path) ON n.path = r.path
+            WHERE TRUE{ns_node}
+            UNION ALL
+            SELECT a.old_path, a.node_uuid, nn.path
+            FROM {P}node_path_alias a JOIN unnest(%s::text[]) AS r(path) ON a.old_path = r.path
+                 JOIN {P}node nn ON nn.uuid = a.node_uuid
+            WHERE TRUE{ns_alias}
+        ) c
+        """,
+            params,
+        )
+    ).fetchall()
+    out: dict[str, dict[str, str]] = {p: {} for p in paths}
+    for req_path, uuid_, cur_path in rows:
+        out.setdefault(req_path, {})[uuid_] = cur_path
+    return out
 
 
 async def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UUID:
@@ -420,6 +530,7 @@ async def resolve_manifest(
     attach_path: bool = True,
     run: RunRow | None = None,
     on_missing: OnMissing = "raise",
+    path_aliases: bool = False,
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a routing manifest to series metadata.
 
@@ -460,6 +571,12 @@ async def resolve_manifest(
     Structural problems (missing or ambiguous routing column, wrong dtype, null
     routing values, missing ``data_type``/``name``) are caller bugs, not catalog
     gaps, and raise either way.
+
+    ``path_aliases`` (read pipelines only) makes the two path-addressed routes
+    honour :class:`~energydb.models.NodePathAlias`, so a path a node has been
+    renamed or moved away from keeps resolving to that node — and a path since
+    claimed by a second node raises :class:`~energydb.errors.PathAliasConflictError`
+    instead of answering with either one's series. Writes leave it off.
     """
     _check_on_missing(on_missing)
     present_routes = [c for c in _MANIFEST_ROUTES if c in manifest.columns]
@@ -504,12 +621,14 @@ async def resolve_manifest(
         # Always attaches edge_uuid so downstream detection and projection work
         # like the edge_uuid route.
         return await _resolve_manifest_by_edge_triple(
-            conn, manifest, run=run, attach_path=attach_path, on_missing=on_missing
+            conn, manifest, run=run, attach_path=attach_path, on_missing=on_missing, path_aliases=path_aliases
         )
     if route == "path":
         # attach_path also surfaces node_uuid for the post-read hierarchy
         # attach.
-        return await _resolve_manifest_by_path(conn, manifest, run=run, attach_path=attach_path, on_missing=on_missing)
+        return await _resolve_manifest_by_path(
+            conn, manifest, run=run, attach_path=attach_path, on_missing=on_missing, path_aliases=path_aliases
+        )
     return await _resolve_manifest_by_owner(
         conn, manifest, owner_col="node_uuid", attach_path=attach_path, run=run, on_missing=on_missing
     )
@@ -696,6 +815,7 @@ async def _resolve_manifest_by_path(
     run: RunRow | None = None,
     attach_path: bool = False,
     on_missing: OnMissing = "raise",
+    path_aliases: bool = False,
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a path-routed manifest to series in ONE round-trip.
 
@@ -706,6 +826,16 @@ async def _resolve_manifest_by_path(
     ``(path, data_type, name)`` triple, dedupe, one indexed ``ANY()`` scan,
     attach ``series_id`` / ``retention`` / ``canonical_unit`` via a
     ``_triple_k`` left-join.
+
+    ``path_aliases`` makes the lookup honour :class:`~energydb.models.NodePathAlias`:
+    a path a node has since moved away from still resolves to that node
+    (``rename`` / ``move_to`` leave the alias behind). Every candidate is read in
+    the same statement — live node and alias target alike — so a path now claimed
+    by two nodes raises :class:`~energydb.errors.PathAliasConflictError` instead
+    of answering with one claimant's series. The resolved frame's ``path`` stays
+    the *requested* path either way, so a caller's own path keys keep working.
+    Read pipelines pass ``True``; writes pass ``False`` (a renamed-away path must
+    not silently accept data).
 
     ``attach_path=True`` (read pipelines) additionally surfaces ``node_uuid``
     on the resolved frame for the post-read hierarchy attach. The manifest's
@@ -740,22 +870,55 @@ async def _resolve_manifest_by_path(
     cte_sql, cte_params = ("", ())
     if run is not None:
         cte_sql, cte_params = run_upsert_cte(run)
-    rows = await (
-        await conn.execute(
-            cte_sql
-            + f"""
+    if path_aliases:
+        rows = await (
+            await conn.execute(
+                cte_sql
+                + _candidate_cte("p", leading=run is None)
+                + f"""
+        SELECT c.req_path, s.data_type, s.name, s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
+               c.uuid::text, c.cur_path
+        FROM c_p c
+        LEFT JOIN {P}series s ON s.node_uuid = c.uuid
+        """,
+                (*cte_params, unique_paths),
+            )
+        ).fetchall()
+    else:
+        rows = [
+            (*row, row[0])
+            for row in await (
+                await conn.execute(
+                    cte_sql
+                    + f"""
         SELECT n.path, s.data_type, s.name, s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
                s.node_uuid::text
         FROM {P}node n
         JOIN {P}series s ON s.node_uuid = n.uuid
         WHERE n.path = ANY(%s)
         """,
-            (*cte_params, unique_paths),
-        )
-    ).fetchall()
+                    (*cte_params, unique_paths),
+                )
+            ).fetchall()
+        ]
     triple_to_meta: dict[tuple[str, str, str], tuple] = {}
-    for path, dt, name, sid, unit, ts_type, retention, node_uuid in rows:
-        triple_to_meta[(path, dt, name)] = (sid, unit, ts_type, retention, node_uuid)
+    # Candidate nodes per requested path, collected over *every* row — including
+    # LEFT-JOIN rows for a candidate with no (matching) series, so an empty
+    # series set cannot hide a conflict.
+    candidates_by_path: dict[str, dict[str, str]] = {}
+    aliased: set[str] = set()
+    for path, dt, name, sid, unit, ts_type, retention, node_uuid, cur_path in rows:
+        if node_uuid is not None:
+            candidates_by_path.setdefault(path, {})[node_uuid] = cur_path
+            if cur_path != path:
+                aliased.add(path)
+        if sid is not None:
+            triple_to_meta[(path, dt, name)] = (sid, unit, ts_type, retention, node_uuid)
+    conflicts = _collect_conflicts(candidates_by_path)
+    if conflicts:
+        # Addressing error, like AmbiguousEdgeError: raises even under
+        # on_missing="skip", and before the missing-series report.
+        raise _path_alias_conflict(conflicts)
 
     unresolved = [t for t in miss_triples if t not in triple_to_meta]
     if unresolved and on_missing == "raise":
@@ -793,6 +956,7 @@ async def _resolve_manifest_by_path(
     summary = ResolveSummary(
         overlapping_series_ids=_overlapping_ids(hash_to_meta),
         missing=_missing_frame(("path", "data_type", "name"), unresolved),
+        aliased_paths=frozenset(aliased),
     )
     return resolved, summary
 
@@ -804,6 +968,7 @@ async def _resolve_manifest_by_edge_triple(
     run: RunRow | None = None,
     attach_path: bool = False,
     on_missing: OnMissing = "raise",
+    path_aliases: bool = False,
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve an edge-triple-routed manifest to series in ONE round-trip.
 
@@ -875,10 +1040,51 @@ async def _resolve_manifest_by_edge_triple(
     cte_sql, cte_params = ("", ())
     if run is not None:
         cte_sql, cte_params = run_upsert_cte(run)
-    rows = await (
-        await conn.execute(
-            cte_sql
-            + f"""
+    if path_aliases:
+        # Each endpoint side resolves through the same live-or-alias candidate
+        # set as the node route. Two UNIONed marker branches report an endpoint
+        # path that is claimed by several nodes *even when no edge joins on it*:
+        # the edge ⋈ candidate join below would otherwise silently return no
+        # rows for that triple, turning a conflict into "series not found".
+        # A marker row carries the conflicted path in its own side's column;
+        # everything else is NULL, typed to keep the UNION's column types (col 6
+        # is the bigint series_id). The claimants themselves are fetched on the
+        # error path only.
+        T = "NULL::text"
+        NF, NT = "NULL::bigint", "NULL::text"
+        FILL_FROM_MARK = [NT] * 5 + [NF] + [NT] * 4  # cols 1..10 on a from_path marker
+        FILL_TO_MARK = [NT] * 6 + [NF] + [NT] * 3  # cols 0..9 on a to_path marker
+        rows = await (
+            await conn.execute(
+                cte_sql
+                + _candidate_cte("f", leading=run is None)
+                + _candidate_cte("t", leading=False)
+                + f"""
+        SELECT cf.req_path, ct.req_path, e.edge_type, e.name, s.data_type, s.name,
+               s.series_id, s.canonical_unit, s.timeseries_type, s.retention, e.uuid::text,
+               {T} AS conflict_side, cf.cur_path AS cf_cur, ct.cur_path AS ct_cur
+        FROM {P}edge e
+        JOIN c_f cf ON cf.uuid = e.from_node_uuid
+        JOIN c_t ct ON ct.uuid = e.to_node_uuid
+        LEFT JOIN {P}series s ON s.edge_uuid = e.uuid
+        WHERE e.edge_type = ANY(%s)
+        UNION ALL
+        SELECT x.req_path, {", ".join(FILL_FROM_MARK)}, 'from_path', {T}, {T}
+        FROM (SELECT req_path FROM c_f GROUP BY req_path HAVING count(DISTINCT uuid) > 1) x
+        UNION ALL
+        SELECT {", ".join(FILL_TO_MARK)}, y.req_path, 'to_path', {T}, {T}
+        FROM (SELECT req_path FROM c_t GROUP BY req_path HAVING count(DISTINCT uuid) > 1) y
+        """,
+                (*cte_params, unique_from, unique_to, unique_etype),
+            )
+        ).fetchall()
+    else:
+        rows = [
+            (*row, None, None, None)
+            for row in await (
+                await conn.execute(
+                    cte_sql
+                    + f"""
         SELECT fn.path, tn.path, e.edge_type, e.name, s.data_type, s.name,
                s.series_id, s.canonical_unit, s.timeseries_type, s.retention, e.uuid::text
         FROM {P}edge e
@@ -887,15 +1093,33 @@ async def _resolve_manifest_by_edge_triple(
         LEFT JOIN {P}series s ON s.edge_uuid = e.uuid
         WHERE fn.path = ANY(%s) AND tn.path = ANY(%s) AND e.edge_type = ANY(%s)
         """,
-            (*cte_params, unique_from, unique_to, unique_etype),
-        )
-    ).fetchall()
+                    (*cte_params, unique_from, unique_to, unique_etype),
+                )
+            ).fetchall()
+        ]
+
+    # Endpoint paths claimed by several nodes: an addressing error, so it raises
+    # even under on_missing="skip" and before the missing-series report.
+    conflicted: dict[str, dict[str, str]] = {}
+    for row in rows:
+        conflict_side = row[11]
+        if conflict_side == "from_path":
+            conflicted.setdefault(row[0], {})
+        elif conflict_side == "to_path":
+            conflicted.setdefault(row[1], {})
+    if conflicted:
+        raise _path_alias_conflict(await _conflict_claimants(conn, sorted(conflicted)))
 
     # The LEFT JOIN keeps series-less edges, so an ambiguous address is caught
     # even when only one of the parallel edges carries the requested series.
     edges_by_triple: dict[tuple[str, str, str], dict[str, str | None]] = {}
     key_to_meta: dict[tuple, tuple] = {}
-    for fp, tp, et, edge_name, dt, sname, sid, unit, ts_type, retention, edge_uuid in rows:
+    aliased: set[str] = set()
+    for fp, tp, et, edge_name, dt, sname, sid, unit, ts_type, retention, edge_uuid, _side, from_cp, to_cp in rows:
+        if from_cp is not None and from_cp != fp:
+            aliased.add(fp)
+        if to_cp is not None and to_cp != tp:
+            aliased.add(tp)
         edges_by_triple.setdefault((fp, tp, et), {})[edge_uuid] = edge_name
         if sid is None:
             continue  # LEFT-JOIN row for a series-less edge
@@ -952,6 +1176,7 @@ async def _resolve_manifest_by_edge_triple(
     summary = ResolveSummary(
         overlapping_series_ids=_overlapping_ids(hash_to_meta),
         missing=_missing_frame(missing_cols, unresolved),
+        aliased_paths=frozenset(aliased),
     )
     return resolved, summary
 
